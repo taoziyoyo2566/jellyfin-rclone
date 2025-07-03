@@ -1,0 +1,53 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: "${USER_UID}:${USER_GID}"
+    restart: unless-stopped
+    ports:
+      - "${JELLYFIN_HTTP_PORT}:8096"
+      - "${JELLYFIN_HTTPS_PORT}:8920"
+      - "7359:7359/udp"
+      - "1900:1900/udp"
+    volumes:
+      - jellyfin_config:/config
+      - jellyfin_cache:/cache
+      - ${PROJECT_DIR}/rclone/gdriver:/media/gdriver:ro
+      - ${PROJECT_DIR}/rclone/onedrive:/media/onedrive:ro
+      - ${PROJECT_DIR}/rclone/backblaze:/media/backblaze:ro
+      - ~/media/movies:/media/movies:ro
+      - ~/media/tvshows:/media/tvshows:ro
+      - ~/media/music:/media/music:ro
+      - ~/media/photos:/media/photos:ro
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    environment:
+      - TZ=${TIMEZONE}
+      - JELLYFIN_PublishedServerUrl=https://${JELLYFIN_DOMAIN}
+      - JELLYFIN_FFMPEG_THROTTLE_LIMIT=80
+      - JELLYFIN_FFMPEG_THREADS=4
+      - JELLYFIN_DLNA_ENABLED=false
+      - JELLYFIN_DISABLE_HTTPS_REDIRECT=true
+      - JELLYFIN_LOG_LEVEL=Info
+    deploy:
+      resources:
+        limits:
+          cpus: '${JELLYFIN_CPU_LIMIT}'
+          memory: ${JELLYFIN_MEMORY_LIMIT}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  jellyfin_config:
+    driver: local
+  jellyfin_cache:
+    driver: local
+
+networks:
+  default:
+    driver: bridge
