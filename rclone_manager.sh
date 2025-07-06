@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly RCLONE_BASE_DIR="${HOME}/.config/rclone-manager"
+readonly RCLONE_BASE_DIR="/opt/docker/jellyfin/rclone"
 readonly DEFAULT_CONFIG_FILE="${RCLONE_BASE_DIR}/config/rclone.conf"
 readonly RCLONE_MOUNT_DIR="${RCLONE_BASE_DIR}/mounts"
 readonly RCLONE_CACHE_DIR="${RCLONE_BASE_DIR}/cache"
@@ -47,11 +47,15 @@ log() {
 }
 
 safe_read() {
-    local prompt="$1" var_name="$2" timeout="${3:-30}"
+    local prompt="$1" var_name="$2" timeout="${3:-60}"
     echo -n "$prompt"
     if ! read -r -t "$timeout" "$var_name"; then
         log "ERROR" "Input timeout or read failed"
         return 1
+    fi
+    # If user just presses Enter, treat as 0 (for menu return)
+    if [[ -z "${!var_name}" ]]; then
+        eval "$var_name=0"
     fi
 }
 
@@ -104,25 +108,28 @@ show_main_menu() {
     echo -e "${BLUE}        rclone Cloud Storage Manager${NC}"
     echo -e "${BLUE}============================================${NC}"
     echo ""
-    echo "1) Initialize rclone environment"
-    echo "2) Configure cloud remotes"
-    echo "3) Mount cloud storage"
-    echo "4) Unmount cloud storage"
-    echo "5) Show mount status"
-    echo "6) Manage systemd services"
-    echo "7) View logs"
-    echo "8) Test connections"
-    echo "9) Cleanup cache"
+    echo " 1) Initialize rclone environment"
+    echo " 2) Configure cloud remotes"
+    echo " 3) Mount cloud storage"
+    echo " 4) Unmount cloud storage"
+    echo " 5) Show mount status"
+    echo " 6) Manage systemd services"
+    echo " 7) View logs"
+    echo " 8) Test connections"
+    echo " 9) Cleanup cache"
     echo "10) Backup configuration"
-    echo "0) Exit"
+    echo " 0) Exit"
     echo ""
 }
 
 get_menu_choice() {
     local choice
-    if ! read -r -t 30 choice; then
+    if ! read -r -t 60 choice; then
         log "ERROR" "Input timeout"
         return 1
+    fi
+    if [[ -z "$choice" ]]; then
+        choice=0
     fi
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 0 ]] || [[ "$choice" -gt 10 ]]; then
         log "ERROR" "Invalid option: $choice"
@@ -133,12 +140,11 @@ get_menu_choice() {
 
 detect_existing_config() {
     log "INFO" "Detecting existing rclone configurations..."
-    
+
     for config_path in "${EXISTING_CONFIGS[@]}"; do
+        [[ "$config_path" == "$DEFAULT_CONFIG_FILE" ]] && continue
         if [[ -f "$config_path" ]] && [[ -s "$config_path" ]]; then
             log "INFO" "Found existing config: $config_path"
-            
-            # Test if config has any remotes
             local remotes
             remotes=$(rclone listremotes --config="$config_path" 2>/dev/null | wc -l)
             if [[ "$remotes" -gt 0 ]]; then
@@ -148,32 +154,31 @@ detect_existing_config() {
                     [[ -n "$remote" ]] && echo "  - ${remote%:}"
                 done
                 echo ""
-                
                 local choice
-                if safe_read "Use this existing config? (y/n): " choice && [[ "$choice" == "y" ]]; then
-                    RCLONE_CONFIG_FILE="$config_path"
-                    log "INFO" "Using existing config: $RCLONE_CONFIG_FILE"
+                if safe_read "Import this config into your manager's config? (y/n): " choice && [[ "$choice" == "y" ]]; then
+                    cp "$config_path" "$DEFAULT_CONFIG_FILE"
+                    chmod 600 "$DEFAULT_CONFIG_FILE"
+                    log "INFO" "Imported config into: $DEFAULT_CONFIG_FILE"
                     return 0
                 fi
             fi
         fi
     done
-    
-    log "INFO" "No existing config selected, will use: $DEFAULT_CONFIG_FILE"
+
+    log "INFO" "No config imported. Using: $DEFAULT_CONFIG_FILE"
     return 1
 }
 
 check_existing_mounts() {
     log "INFO" "Checking for existing mounts..."
-    
-    # Check common mount points
+
     local -a common_mount_dirs=(
         "/mnt"
         "/media"
         "${HOME}/mounts"
         "/opt/docker/jellyfin/rclone"
     )
-    
+
     for mount_dir in "${common_mount_dirs[@]}"; do
         if [[ -d "$mount_dir" ]]; then
             for remote in "${SUPPORTED_REMOTES[@]}"; do
@@ -181,7 +186,6 @@ check_existing_mounts() {
                 if [[ -d "$potential_mount" ]] && mountpoint -q "$potential_mount" 2>/dev/null; then
                     log "WARN" "Found existing mount: $potential_mount"
                     echo "Existing mount detected: $potential_mount"
-                    
                     local choice
                     if safe_read "Unmount this before proceeding? (y/n): " choice && [[ "$choice" == "y" ]]; then
                         if fusermount -u "$potential_mount" 2>/dev/null; then
@@ -196,54 +200,72 @@ check_existing_mounts() {
     done
 }
 
-init_environment() {
+install_missing_packages() {
+    # Ensure rclone and fuse installed, prompt and install if missing
+    local missing=()
+    check_command rclone   || missing+=("rclone")
+    check_command fusermount || check_command fusermount3 || missing+=("fuse3")
+    check_command systemctl || missing+=("systemd")
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        log "WARN" "Some required packages are missing: ${missing[*]}"
+        echo "Detected Debian/Ubuntu system? (y/n): "
+        local confirm=""
+        read -r confirm
+        if [[ "$confirm" == "y" ]]; then
+            sudo apt-get update
+            for pkg in "${missing[@]}"; do
+                if [[ "$pkg" == "rclone" ]]; then
+                    curl https://rclone.org/install.sh | sudo bash
+                else
+                    sudo apt-get install -y "$pkg"
+                fi
+            done
+        else
+            log "ERROR" "Please install the missing packages manually: ${missing[*]}"
+            exit 1
+        fi
+    fi
+}
+
 init_environment() {
     log "INFO" "Initializing rclone environment..."
-    
-    if ! check_command rclone; then
-        log "ERROR" "rclone not installed. Install with: curl https://rclone.org/install.sh | sudo bash"
-        return 1
-    fi
-    
-    # Check for existing configurations first
+
+    install_missing_packages
+
     detect_existing_config
-    
-    # Check for existing mounts
     check_existing_mounts
-    
+
     safe_mkdir "$RCLONE_BASE_DIR" 700
     safe_mkdir "${DEFAULT_CONFIG_FILE%/*}" 700
     safe_mkdir "$RCLONE_MOUNT_DIR" 755
     safe_mkdir "$RCLONE_CACHE_DIR" 700
     safe_mkdir "$RCLONE_LOG_DIR" 755
     safe_mkdir "$SYSTEMD_USER_DIR" 755
-    
+
     for remote in "${SUPPORTED_REMOTES[@]}"; do
         safe_mkdir "$RCLONE_MOUNT_DIR/$remote" 755
     done
-    
-    # Only create new config if using default location and it doesn't exist
+
     if [[ "$RCLONE_CONFIG_FILE" == "$DEFAULT_CONFIG_FILE" ]] && [[ ! -f "$RCLONE_CONFIG_FILE" ]]; then
         touch "$RCLONE_CONFIG_FILE"
         chmod 600 "$RCLONE_CONFIG_FILE"
         log "INFO" "Created new config file: $RCLONE_CONFIG_FILE"
     fi
-    
+
     systemctl --user daemon-reload &>/dev/null || true
     log "INFO" "Environment initialized successfully"
     log "INFO" "Using config file: $RCLONE_CONFIG_FILE"
 }
-}
 
 configure_remote() {
     log "INFO" "Configuring cloud remotes..."
-    
+
     if [[ ! -f "$RCLONE_CONFIG_FILE" ]]; then
         log "ERROR" "Config file not found: $RCLONE_CONFIG_FILE"
         log "INFO" "Run initialization first or check config file location"
         return 1
     fi
-    
+
     if [[ -s "$RCLONE_CONFIG_FILE" ]]; then
         log "INFO" "Current remotes in $RCLONE_CONFIG_FILE:"
         rclone listremotes --config="$RCLONE_CONFIG_FILE" | while read -r remote; do
@@ -251,68 +273,73 @@ configure_remote() {
         done
         echo ""
     fi
-    
+
     local choice
     if ! safe_read "Add/modify remote configuration? (y/n): " choice; then
         return 1
     fi
     [[ "$choice" != "y" ]] && return 0
-    
+
     if [[ -f "$RCLONE_CONFIG_FILE" ]]; then
         local backup_file="${RCLONE_CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
         cp "$RCLONE_CONFIG_FILE" "$backup_file" && log "INFO" "Config backed up to: $backup_file"
     fi
-    
+
     if ! rclone config --config="$RCLONE_CONFIG_FILE"; then
         log "ERROR" "Configuration failed"
         return 1
     fi
-    
+
     chmod 600 "$RCLONE_CONFIG_FILE"
     log "INFO" "Configuration completed"
 }
 
 mount_remote() {
     log "INFO" "Mounting cloud storage..."
-    
+
     if [[ ! -f "$RCLONE_CONFIG_FILE" ]] || [[ ! -s "$RCLONE_CONFIG_FILE" ]]; then
         log "ERROR" "No rclone configuration found"
         return 1
     fi
-    
+
     local -a available_remotes
     while IFS= read -r remote; do
         [[ -n "$remote" ]] && available_remotes+=("${remote%:}")
     done < <(rclone listremotes --config="$RCLONE_CONFIG_FILE")
-    
+
     if [[ ${#available_remotes[@]} -eq 0 ]]; then
         log "ERROR" "No remotes configured"
         return 1
     fi
-    
+
     echo "Available remotes:"
     for i in "${!available_remotes[@]}"; do
         echo "  $((i+1))) ${available_remotes[i]}"
     done
-    
+    echo "  0) Return to main menu"
+
     local choice
-    if ! safe_read "Select remote [1-${#available_remotes[@]}]: " choice; then
+    if ! safe_read "Select remote [0-${#available_remotes[@]}]: " choice; then
         return 1
     fi
-    
+
+    if [[ "$choice" == "0" ]]; then
+        return 0
+    fi
+
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#available_remotes[@]} ]]; then
         log "ERROR" "Invalid selection: $choice"
         return 1
     fi
-    
+
     local remote_name="${available_remotes[$((choice-1))]}"
-    
+
     if ! validate_remote_name "$remote_name"; then
         return 1
     fi
-    
+
     local mount_point="$RCLONE_MOUNT_DIR/$remote_name"
-    
+
     if mountpoint -q "$mount_point" 2>/dev/null; then
         log "WARN" "$remote_name already mounted"
         local remount_choice
@@ -322,16 +349,16 @@ mount_remote() {
             return 0
         fi
     fi
-    
+
     log "INFO" "Testing connection..."
     if ! timeout 30 rclone lsd "${remote_name}:" --config="$RCLONE_CONFIG_FILE" &>/dev/null; then
         log "ERROR" "Cannot connect to: $remote_name"
         return 1
     fi
-    
+
     safe_mkdir "$mount_point" 755
     create_mount_service "$remote_name" "$mount_point"
-    
+
     if systemctl --user start "rclone-mount-${remote_name}.service"; then
         local timeout=30
         while [[ $timeout -gt 0 ]]; do
@@ -354,7 +381,7 @@ mount_remote() {
 create_mount_service() {
     local remote_name="$1" mount_point="$2"
     local service_file="$SYSTEMD_USER_DIR/rclone-mount-${remote_name}.service"
-    
+
     cat > "$service_file" << EOF
 [Unit]
 Description=rclone mount for $remote_name
@@ -381,14 +408,14 @@ RestartSec=30
 [Install]
 WantedBy=default.target
 EOF
-    
+
     chmod 644 "$service_file"
     systemctl --user daemon-reload
 }
 
 unmount_remote() {
     log "INFO" "Unmounting cloud storage..."
-    
+
     local -a mounted_remotes
     for remote in "${SUPPORTED_REMOTES[@]}"; do
         local mount_point="$RCLONE_MOUNT_DIR/$remote"
@@ -396,30 +423,36 @@ unmount_remote() {
             mounted_remotes+=("$remote")
         fi
     done
-    
+
     if [[ ${#mounted_remotes[@]} -eq 0 ]]; then
         log "INFO" "No mounted remotes found"
         return 0
     fi
-    
+
     echo "Mounted remotes:"
     for i in "${!mounted_remotes[@]}"; do
         echo "  $((i+1))) ${mounted_remotes[i]}"
     done
     echo "  $((${#mounted_remotes[@]}+1))) Unmount all"
-    
+    echo "  0) Return to main menu"
+
     local choice
-    if ! safe_read "Select [1-$((${#mounted_remotes[@]}+1))]: " choice; then
+    if ! safe_read "Select [0-$((${#mounted_remotes[@]}+1))]: " choice; then
         return 1
     fi
-    
-    if [[ "$choice" -eq $((${#mounted_remotes[@]}+1)) ]]; then
+
+    if [[ "$choice" == "0" ]]; then
+        return 0
+    elif [[ "$choice" -eq $((${#mounted_remotes[@]}+1)) ]]; then
         for remote in "${mounted_remotes[@]}"; do
             unmount_single_remote "$remote"
         done
-    else
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#mounted_remotes[@]} ]]; then
         local remote_name="${mounted_remotes[$((choice-1))]}"
         unmount_single_remote "$remote_name"
+    else
+        log "ERROR" "Invalid selection"
+        return 1
     fi
 }
 
@@ -427,14 +460,14 @@ unmount_single_remote() {
     local remote_name="$1"
     local mount_point="$RCLONE_MOUNT_DIR/$remote_name"
     local service_name="rclone-mount-${remote_name}.service"
-    
+
     systemctl --user stop "$service_name" 2>/dev/null || true
     systemctl --user disable "$service_name" 2>/dev/null || true
-    
+
     if mountpoint -q "$mount_point" 2>/dev/null; then
         fusermount -u "$mount_point" 2>/dev/null || fusermount -uz "$mount_point" 2>/dev/null || true
     fi
-    
+
     if ! mountpoint -q "$mount_point" 2>/dev/null; then
         log "INFO" "$remote_name unmounted successfully"
     else
@@ -445,11 +478,11 @@ unmount_single_remote() {
 
 show_mount_status() {
     log "INFO" "Mount status:"
-    
+
     for remote in "${SUPPORTED_REMOTES[@]}"; do
         local mount_point="$RCLONE_MOUNT_DIR/$remote"
         [[ ! -d "$mount_point" ]] && continue
-        
+
         echo -n "$remote: "
         if mountpoint -q "$mount_point" 2>/dev/null; then
             echo -e "${GREEN}Mounted${NC}"
@@ -461,21 +494,26 @@ show_mount_status() {
             echo -e "${RED}Not mounted${NC}"
         fi
     done
+    echo ""
+    echo "Press Enter to return to main menu..."
+    read -r
 }
 
 manage_services() {
     echo "Service management:"
-    echo "1) Start all services"
-    echo "2) Stop all services"
-    echo "3) Restart all services"
-    echo "4) Show service status"
-    
+    echo " 1) Start all services"
+    echo " 2) Stop all services"
+    echo " 3) Restart all services"
+    echo " 4) Show service status"
+    echo " 0) Return to main menu"
+
     local choice
-    if ! safe_read "Select [1-4]: " choice; then
+    if ! safe_read "Select [0-4]: " choice; then
         return 1
     fi
-    
+
     case "$choice" in
+        0) return 0 ;;
         1) for remote in "${SUPPORTED_REMOTES[@]}"; do
                systemctl --user start "rclone-mount-${remote}.service" 2>/dev/null || true
            done ;;
@@ -493,7 +531,11 @@ manage_services() {
                    echo -e "${RED}Inactive${NC}"
                fi
            done ;;
+        *) log "ERROR" "Invalid option";;
     esac
+    echo ""
+    echo "Press Enter to return to main menu..."
+    read -r
 }
 
 view_logs() {
@@ -501,37 +543,46 @@ view_logs() {
         log "ERROR" "Log directory not found"
         return 1
     fi
-    
+
     echo "Available logs:"
     local -a log_files=("$RCLONE_LOG_DIR"/*.log)
-    
+
     if [[ ! -f "${log_files[0]}" ]]; then
         log "INFO" "No log files found"
+        echo "Press Enter to return to main menu..."
+        read -r
         return 0
     fi
-    
+
     for i in "${!log_files[@]}"; do
         echo "  $((i+1))) $(basename "${log_files[i]}")"
     done
-    
+    echo "  0) Return to main menu"
+
     local choice
-    if ! safe_read "Select log [1-${#log_files[@]}]: " choice; then
+    if ! safe_read "Select log [0-${#log_files[@]}]: " choice; then
         return 1
     fi
-    
+
+    if [[ "$choice" == "0" ]]; then
+        return 0
+    fi
+
     if [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#log_files[@]} ]]; then
         tail -f "${log_files[$((choice-1))]}"
+    else
+        log "ERROR" "Invalid selection"
     fi
 }
 
 test_connections() {
     log "INFO" "Testing connections..."
-    
+
     if [[ ! -f "$RCLONE_CONFIG_FILE" ]]; then
         log "ERROR" "No configuration file found"
         return 1
     fi
-    
+
     while read -r remote; do
         if [[ -n "$remote" ]]; then
             remote_clean="${remote%:}"
@@ -543,6 +594,8 @@ test_connections() {
             fi
         fi
     done < <(rclone listremotes --config="$RCLONE_CONFIG_FILE")
+    echo "Press Enter to return to main menu..."
+    read -r
 }
 
 cleanup_cache() {
@@ -550,7 +603,7 @@ cleanup_cache() {
         local cache_size
         cache_size=$(du -sh "$RCLONE_CACHE_DIR" | cut -f1)
         log "INFO" "Current cache size: $cache_size"
-        
+
         local choice
         if safe_read "Clear cache? (y/n): " choice && [[ "$choice" == "y" ]]; then
             rm -rf "${RCLONE_CACHE_DIR:?}"/*
@@ -559,6 +612,8 @@ cleanup_cache() {
     else
         log "INFO" "No cache directory found"
     fi
+    echo "Press Enter to return to main menu..."
+    read -r
 }
 
 backup_config() {
@@ -566,7 +621,7 @@ backup_config() {
         log "ERROR" "No configuration to backup"
         return 1
     fi
-    
+
     local backup_file="${RCLONE_BASE_DIR}/rclone-backup-$(date +%Y%m%d_%H%M%S).conf"
     if cp "$RCLONE_CONFIG_FILE" "$backup_file"; then
         chmod 600 "$backup_file"
@@ -575,18 +630,20 @@ backup_config() {
         log "ERROR" "Backup failed"
         return 1
     fi
+    echo "Press Enter to return to main menu..."
+    read -r
 }
 
 main() {
     while true; do
         show_main_menu
         echo -n "Enter option [0-10]: "
-        
+
         local choice
         if ! choice=$(get_menu_choice); then
             continue
         fi
-        
+
         case $choice in
             1) init_environment ;;
             2) configure_remote ;;
@@ -601,9 +658,6 @@ main() {
             0) log "INFO" "Goodbye!"; exit 0 ;;
             *) log "ERROR" "Invalid option"; sleep 1 ;;
         esac
-        
-        echo ""; echo "Press Enter to continue..."
-        read -r
     done
 }
 
