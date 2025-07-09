@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   jellyfin:
     image: jellyfin/jellyfin:latest
@@ -6,45 +8,35 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${JELLYFIN_HTTP_PORT}:8096"
-      - "127.0.0.1:${JELLYFIN_HTTPS_PORT}:8920"
-    volumes:
-      - jellyfin_config:/config
-      - jellyfin_cache:/cache
-      - ${PROJECT_DIR}/rclone/gdriver:/media/gdriver:ro
-      - ${PROJECT_DIR}/rclone/onedrive:/media/onedrive:ro
-      - ${PROJECT_DIR}/rclone/backblaze:/media/backblaze:ro
-      - ~/media/movies:/media/movies:ro
-      - ~/media/tvshows:/media/tvshows:ro
-      - ~/media/music:/media/music:ro
-      - ~/media/photos:/media/photos:ro
-      - /etc/localtime:/etc/localtime:ro
-    env_file:
-      - .env
     environment:
       - TZ=${TIMEZONE}
-        #- JELLYFIN_PublishedServerUrl=https://${JELLYFIN_DOMAIN}
       - JELLYFIN_FFMPEG_THROTTLE_LIMIT=80
       - JELLYFIN_FFMPEG_THREADS=4
       - JELLYFIN_DLNA_ENABLED=false
       - JELLYFIN_DISABLE_HTTPS_REDIRECT=true
       - JELLYFIN_LOG_LEVEL=Info
-    deploy:
-      resources:
-        limits:
-          cpus: '${JELLYFIN_CPU_LIMIT}'
-          memory: ${JELLYFIN_MEMORY_LIMIT}
+    volumes:
+      # Jellyfin 配置/缓存数据持久化
+      - ${PROJECT_DIR}/config:/config
+      - ${PROJECT_DIR}/cache:/cache
+      # rclone 挂载云盘（只读）
+      - ${RCLONE_GDRIVE_MNT}:/media/gdriver:ro
+      # - ${RCLONE_DROPBOX_MNT}:/media/dropbox:ro
+      #- ${RCLONE_ONEDRIVE_MNT}:/media/onedrive:ro
+      #- ${RCLONE_BACKBLAZE_MNT}:/media/backblaze:ro
+      # 本地媒体库（只读）
+      - ${MEDIA_MOVIES}:/media/movies:ro
+      - ${MEDIA_TVSHOWS}:/media/tvshows:ro
+      - ${MEDIA_MUSIC}:/media/music:ro
+      - ${MEDIA_PHOTOS}:/media/photos:ro
+      # 保持容器时间同步
+      - /etc/localtime:/etc/localtime:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-
-volumes:
-  jellyfin_config:
-    driver: local
-  jellyfin_cache:
-    driver: local
 
 networks:
   default:
