@@ -319,6 +319,8 @@ EOF
 initialize_environment() {
     print_header "Environment Initialization"
     detect_permissions
+    install_fuse3 || { log "ERROR" "FUSE 3 (fusermount3) is required. Exiting."; pause; return 1; }
+    configure_fuse_allow_other
     if ! find_rclone_binary; then
         log "WARNING" "rclone not found"
         if confirm "Install rclone now?"; then
@@ -331,6 +333,48 @@ initialize_environment() {
     fi
     log "SUCCESS" "Environment initialized"
     pause
+}
+install_fuse3() {
+    log "INFO" "Checking fusermount3 (FUSE 3) ..."
+    if command -v fusermount3 &>/dev/null; then
+        log "SUCCESS" "fusermount3 is already installed."
+        return 0
+    fi
+
+    log "WARNING" "fusermount3 not found. Trying to install FUSE 3..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y fuse3
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y fuse3
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy --noconfirm fuse3
+    else
+        log "ERROR" "No supported package manager found! Please install FUSE 3 (fusermount3) manually."
+        return 1
+    fi
+
+    if command -v fusermount3 &>/dev/null; then
+        log "SUCCESS" "fusermount3 installed successfully."
+        return 0
+    else
+        log "ERROR" "Failed to install fusermount3. Please check your package manager or install FUSE 3 manually."
+        return 1
+    fi
+}
+
+configure_fuse_allow_other() {
+    local fuse_conf="/etc/fuse.conf"
+    if [[ ! -f "$fuse_conf" ]]; then
+        log "WARNING" "$fuse_conf not found, creating..."
+        echo "user_allow_other" | sudo tee "$fuse_conf" >/dev/null
+        sudo chmod 644 "$fuse_conf"
+    elif ! grep -q "^user_allow_other" "$fuse_conf"; then
+        log "INFO" "Enabling 'user_allow_other' in $fuse_conf"
+        echo "user_allow_other" | sudo tee -a "$fuse_conf" >/dev/null
+    else
+        log "SUCCESS" "'user_allow_other' already set in $fuse_conf"
+    fi
 }
 
 configure_remote() {
